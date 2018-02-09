@@ -1,0 +1,99 @@
+#!/usr/bin/env ruby
+
+require "libvirt"
+require "trollop"
+require "uuid"
+require "nokogiri"
+require "byebug"
+
+def parse_args
+  Trollop::options do
+    opt :server, "server hostname/ip address", :type => :string
+    opt :user,   "username",                   :type => :string
+    opt :vm,     "vm name/uuid",               :type => :string
+  end
+end
+
+def connect_uri(server, username)
+  local = server.nil? || ["localhost", "0.0.0.0", "127.0.0.0"].include?(server)
+  protocol = local ? "qemu" : "qemu+ssh"
+
+  uri = "#{protocol}://"
+  uri << "#{username}@" unless username.nil?
+  uri << server         unless server.nil?
+  uri << "/system"
+
+  uri
+end
+
+def connect(server = nil, username = nil)
+  Libvirt::open(connect_uri(server, username))
+end
+
+def find_vm(conn, vm_ref)
+  meth = UUID.validate(vm_ref) ? :lookup_domain_by_uuid : :lookup_domain_by_name
+  conn.send(meth, vm_ref)
+rescue Libvirt::RetrieveError => err
+  puts "Failed to find #{vm_ref}: #{err}"
+end
+
+def vm_info(vm)
+  Nokogiri::XML(vm.xml_desc)
+end
+
+def vm_disks(vm_xml)
+  vm_xml.xpath('//devices/disk').map do |disk_xml|
+    disk_hash = {}
+    disk_xml.elements.each do |element|
+      case element.name
+      when 'source'
+        disk_hash[:path] = element.attributes["file"].value
+      when 'target'
+        disk_hash[:dev] = element.attributes["dev"].value
+      end
+    end
+    disk_hash
+  end
+end
+
+def snapshot_xml(vm, timestamp, disks)
+  builder = Nokogiri::XML::Builder.new do |xml|
+    xml.domainsnapshot {
+      xml.description "Backup #{timestamp}"
+      xml.disks {
+        disks.each do |disk|
+          xml.disk(:name => disk[:path]) {
+            dir = File.dirname(disk[:path])
+            filename = "#{File.basename(disk[:path]).split(".")[0]}_#{timestamp}.qcow2"
+            xml.source File.join(dir, filename)
+          }
+        end
+      }
+    }
+  end
+  builder.doc.root.to_xml
+end
+
+def vm_snapshot(vm, xml, flags = Libvirt::Domain::Snapshot::CREATE_DISK_ONLY | Libvirt::Domain::Snapshot::CREATE_ATOMIC)
+  vm.snapshot_create_xml(xml, flags)
+end
+
+def main
+  args = parse_args
+
+  timestamp = Time.now.to_i
+
+  conn = connect(args[:server], args[:user])
+
+  vm = find_vm(conn, args[:vm])
+  vm_xml = vm_info(vm)
+  disks = vm_disks(vm_xml)
+
+  puts "Backing up #{vm.name}, disks [#{disks.map { |disk| disk[:dev] }.join(", ") }]"
+
+  snapshot = vm_snapshot(vm, snapshot_xml(vm, timestamp, disks))
+ensure
+  conn.close
+end
+
+main
